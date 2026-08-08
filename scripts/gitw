@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# gitw — an ace-inspired git wrapper.
+#
+# Design, stolen from ACE (github.com/cs3b/ace, ace-git gem):
+#   - commands live in gitw.d/*.sh and self-register by filename
+#   - bare git range args (HEAD, main..HEAD, HEAD~2, @{1}) route to `diff`
+#   - config cascade: project (.gitw/config) > user (~/.config/gitw/config) > defaults
+#   - exit codes: 0 success, 1 error, 2 usage/unknown command
+#   - color only when stdout is a TTY and NO_COLOR is unset
+#
+# To add a command: drop a file into gitw.d/<name>.sh defining
+#   gitw_cmd_<name>() { ... }        # the command body
+#   gitw_usage_<name>() { ... }      # one-line help (optional)
+# Done. `gitw help` picks it up automatically.
+
+set -u
+
+# Resolve our own location (works through symlinks).
+GITW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+GITW_COMMANDS_DIR="${GITW_COMMANDS_DIR:-$GITW_ROOT/gitw.d}"
+GITW_APP_ROOT="${GITW_APP_ROOT:-$(dirname "$GITW_ROOT")}"
+GITW_VERSION="0.2.0"
+
+# --- color support ----------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${GITW_NO_COLOR:-}" ]; then
+  GITW_COLOR=1
+else
+  GITW_COLOR=0
+fi
+
+# --- core helpers -----------------------------------------------------------
+gitw_die()   { printf 'gitw: %s\n' "$*" >&2; exit 1; }
+gitw_msg()   { printf '%s\n' "$*"; }
+gitw_warn()  { printf 'gitw: %s\n' "$*" >&2; }
+
+gitw_color() {
+  local code="$1"; shift
+  if [ "$GITW_COLOR" = 1 ]; then printf '\033[%sm%s\033[0m' "$code" "$*"
+  else printf '%s' "$*"; fi
+}
+gitw_red()    { gitw_color 31 "$*"; }
+gitw_green()  { gitw_color 32 "$*"; }
+gitw_yellow() { gitw_color 33 "$*"; }
+gitw_cyan()   { gitw_color 36 "$*"; }
+gitw_bold()   { gitw_color 1 "$*"; }
+
+gitw_is_git_repo() { command git rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+
+gitw_require_repo() {
+  gitw_is_git_repo || gitw_die "not inside a git work tree"
+  return 0
+}
+
+# --- configuration cascade --------------------------------------------------
+# precedence: project (.gitw/config) > user (~/.config/gitw/config) > defaults
+GITW_DEFAULTS_FILE="$GITW_COMMANDS_DIR/defaults.conf"
+
+gitw_user_config() {
+  local base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  printf '%s' "$base/gitw/config"
+}
+
+gitw_project_config() {
+  # walk up from cwd looking for .gitw/config
+  local dir cwd
+  cwd="$(pwd -P 2>/dev/null || pwd)"
+  dir="$cwd"
+  while :; do
+    if [ -f "$dir/.gitw/config" ]; then printf '%s' "$dir/.gitw/config"; return 0; fi
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+gitw_config_get() {
+  local key="$1" file value re
+  re="^[[:space:]]*${key//./\\.}[[:space:]]*[=:]"
+  if file="$(gitw_project_config 2>/dev/null)" && [ -f "$file" ]; then
+    value="$(sed -n "s/${re}[[:space:]]*//p" "$file" 2>/dev/null | tail -n 1)"
+    [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+  fi
+  file="$(gitw_user_config)"
+  if [ -f "$file" ]; then
+    value="$(sed -n "s/${re}[[:space:]]*//p" "$file" 2>/dev/null | tail -n 1)"
+    [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+  fi
+  if [ -f "$GITW_DEFAULTS_FILE" ]; then
+    value="$(sed -n "s/${re}[[:space:]]*//p" "$GITW_DEFAULTS_FILE" 2>/dev/null | tail -n 1)"
+    [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+  fi
+  return 1
+}
+
+gitw_config_list() {
+  local keys f
+  keys="$(sed -n 's/^[[:space:]]*\([A-Za-z0-9._-]*\)[[:space:]]*[=:].*/\1/p' "$GITW_DEFAULTS_FILE" 2>/dev/null)"
+  for f in "$(gitw_user_config)" "$(gitw_project_config 2>/dev/null)"; do
+    [ -f "$f" ] || continue
+    keys="$keys
+$(sed -n 's/^[[:space:]]*\([A-Za-z0-9._-]*\)[[:space:]]*[=:].*/\1/p' "$f")"
+  done
+  printf '%s\n' "$keys" | sort -u
+}
+
+# --- smart arg routing (ace-git style) ---------------------------------------
+gitw_is_range() {
+  case "${1:-}" in
+    "")              return 1 ;;
+    *\.\.\.*|*\.\.*) return 0 ;;   # main..HEAD, a...b
+    HEAD)            return 0 ;;
+    *~*|*\^*|*@\{*)  return 0 ;;   # HEAD~2, HEAD^, @{1}
+    *)               return 1 ;;
+  esac
+}
+
+# --- built-ins ---------------------------------------------------------------
+gitw_cmd_version() {
+  gitw_msg "gitw $GITW_VERSION (ace-inspired git wrapper)"
+}
+
+GITW_EXAMPLES=(
+  "gitw                      # help"
+  "gitw status               # repo state + PR context"
+  "gitw status -f json       # machine-readable state"
+  "gitw diff HEAD~3          # bare ranges route to diff"
+  "gitw diff -s 7d           # changes since a week ago"
+  "gitw diff -f grouped-stats -e 'docs/**'  # grouped, excluding docs"
+  "gitw tree                 # managed engine trees (servo/chromium/depot_tools)"
+)
+
+gitw_cmd_help() {
+  gitw_msg "$(gitw_bold "gitw") — an ace-inspired git wrapper"
+  gitw_msg ""
+  gitw_msg "usage: gitw <command> [args...]"
+  gitw_msg "       bare ranges (HEAD, main..HEAD, HEAD~2, @{1}) route to 'diff'"
+  gitw_msg ""
+  gitw_msg "commands:"
+  local mod name
+  for mod in "$GITW_COMMANDS_DIR"/*.sh; do
+    [ -f "$mod" ] || continue
+    name="$(basename "$mod" .sh)"
+    if declare -F "gitw_usage_$name" >/dev/null 2>&1; then
+      printf '  %-10s %s\n' "$name" "$(gitw_usage_$name)"
+    elif declare -F "gitw_cmd_$name" >/dev/null 2>&1; then
+      printf '  %-10s\n' "$name"
+    fi
+  done
+  gitw_msg ""
+  gitw_msg "examples:"
+  local ex
+  for ex in "${GITW_EXAMPLES[@]}"; do
+    gitw_msg "  $ex"
+  done
+}
+
+# --- load command modules -----------------------------------------------------
+# atoms first (gitw_git, helpers) so every command can use them
+# shellcheck source=/dev/null
+source "$GITW_COMMANDS_DIR/exec.sh"
+
+for _mod in "$GITW_COMMANDS_DIR"/*.sh; do
+  [ -f "$_mod" ] || continue
+  case "$_mod" in
+    */exec.sh) continue ;;
+  esac
+  # shellcheck source=/dev/null
+  source "$_mod"
+done
+
+# --- dispatch ------------------------------------------------------------------
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+if gitw_is_range "$cmd"; then
+  gitw_cmd_diff "$cmd" "$@"
+  exit $?
+fi
+
+case "$cmd" in
+  ""|help|--help|-h)      gitw_cmd_help;    exit 0 ;;
+  version|--version|-V)   gitw_cmd_version; exit 0 ;;
+esac
+
+if declare -F "gitw_cmd_$cmd" >/dev/null 2>&1; then
+  "gitw_cmd_$cmd" "$@"
+  exit $?
+fi
+
+gitw_warn "unknown command: ${cmd:-}"
+gitw_warn "run 'gitw help' for usage"
+exit 2
